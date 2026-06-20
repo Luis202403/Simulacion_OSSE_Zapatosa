@@ -1,0 +1,267 @@
+/**************************************************************************************
+ *  DETECCIÓN Y CUANTIFICACIÓN DE MACRÓFITAS FLOTANTES — CIÉNAGA DE ZAPATOSA
+ *  Plataforma: Google Earth Engine (Code Editor, JavaScript API)
+ *
+ *  Objetivo:
+ *    Estimar mes a mes (varios años) el área cubierta por vegetación acuática
+ *    flotante/emergente (p. ej. buchón de agua, Eichhornia crassipes) sobre el
+ *    espejo de agua del complejo cenagoso de Zapatosa, y exportar una tabla CSV
+ *    con las áreas calculadas.
+ *
+ *  Lógica metodológica:
+ *    1. Se define el "dominio acuático" con la capa JRC Global Surface Water
+ *       (ocurrencia de agua 1984-2021). Esto restringe el análisis al cuerpo de
+ *       agua y excluye la vegetación terrestre de las márgenes (Pekel et al., 2016).
+ *    2. Por cada mes se construye un compuesto mediano de Sentinel-2 SR
+ *       (enmascarado de nubes con la banda SCL + QA60).
+ *    3. Dentro del dominio acuático se clasifica cada píxel por NDVI:
+ *           NDVI < 0.20            -> agua abierta
+ *           0.20 <= NDVI < 0.40    -> vegetación dispersa / sumergida
+ *           NDVI >= 0.40           -> macrófitas flotantes/emergentes
+ *       (umbrales según Gerardo & de Lima, 2022).
+ *    4. El área de cada clase se calcula con ee.Image.pixelArea().
+ *    5. Se registra también el área con datos válidos (libre de nubes) por mes,
+ *       para evaluar la confiabilidad de cada estimación.
+ *    6. La tabla mensual multianual se exporta a Google Drive (CSV).
+ *
+ *  Nota sobre recursos computacionales:
+ *    - El cálculo pesado se delega a Export.table.toDrive (sistema batch de Google),
+ *      que es robusto frente a límites de la sesión interactiva.
+ *    - Se usa scale=20 m, bestEffort=true, tileScale=4 y maxPixels alto para evitar
+ *      errores de "computation timed out" / "user memory limit exceeded".
+ *    - Para vista previa interactiva se grafican pocos meses; la serie completa va al CSV.
+ **************************************************************************************/
+
+// ============================================================
+// 1) PARÁMETROS EDITABLES
+// ============================================================
+var ANIO_INICIO   = 2019;     // Sentinel-2 SR confiable desde 2017; recomiendo >= 2018
+var ANIO_FIN      = 2023;
+var ESCALA        = 20;       // m. Resolución de cálculo (20 reduce carga vs 10)
+var NDVI_FLOTANTE = 0.40;     // umbral macrófitas flotantes (Gerardo & de Lima, 2022)
+var NDVI_AGUA     = 0.20;     // umbral agua abierta
+var OCURRENCIA_MIN = 10;      // % mínimo de ocurrencia de agua (JRC) para el dominio acuático
+var NUBES_MAX     = 80;       // % máximo de nubes por escena para incluirla en el compuesto
+
+// --- Región de interés (ROI) ---
+// Rectángulo aproximado sobre la ciénaga central (Chimichagua, Cesar).
+// RECOMENDADO: reemplazar por tu propio shapefile subido como asset para mayor precisión.
+var roi = ee.Geometry.Rectangle([-73.95, 8.95, -73.60, 9.35]);
+// var roi = ee.FeatureCollection('users/TU_USUARIO/zapatosa_limite').geometry();
+
+Map.centerObject(roi, 10);
+Map.addLayer(roi, {color: 'red'}, 'ROI (límite de análisis)', false);
+
+// ============================================================
+// 2) DOMINIO ACUÁTICO (espejo de agua histórico) — JRC GSW
+// ============================================================
+var jrc = ee.Image('JRC/GSW1_4/GlobalSurfaceWater');
+var mascaraAcuatica = jrc.select('occurrence')
+                         .gte(OCURRENCIA_MIN)
+                         .selfMask()            // 1 donde es agua >= umbral, enmascarado en el resto
+                         .clip(roi);
+Map.addLayer(mascaraAcuatica, {palette: ['#1f78b4']}, 'Dominio acuático (JRC)', false);
+
+// Área total del dominio acuático (constante de referencia, en hectáreas)
+var areaDominioHa = ee.Image.pixelArea().updateMask(mascaraAcuatica)
+  .reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: roi, scale: ESCALA,
+    maxPixels: 1e13, bestEffort: true, tileScale: 4
+  }).getNumber('area').divide(1e4);
+print('Área del dominio acuático (ha):', areaDominioHa);
+
+// ============================================================
+// 3) ENMASCARADO DE NUBES Y CÁLCULO DE ÍNDICES (Sentinel-2 SR)
+// ============================================================
+function enmascararS2(img) {
+  var scl = img.select('SCL');
+  // Conservar: 4 veg, 5 suelo, 6 agua, 7 sin clasificar. Quitar nubes/sombras/cirros/saturado.
+  var buenos = scl.neq(1)   // saturado/defectuoso
+                  .and(scl.neq(3))   // sombra de nube
+                  .and(scl.neq(8))   // nube prob. media
+                  .and(scl.neq(9))   // nube prob. alta
+                  .and(scl.neq(10))  // cirros
+                  .and(scl.neq(11)); // nieve/hielo
+  var qa = img.select('QA60');
+  var qaMask = qa.bitwiseAnd(1 << 10).eq(0).and(qa.bitwiseAnd(1 << 11).eq(0));
+  return img.updateMask(buenos).updateMask(qaMask);
+}
+
+function agregarIndices(img) {
+  var ndvi  = img.normalizedDifference(['B8', 'B4']).rename('NDVI');   // vegetación
+  var mndwi = img.normalizedDifference(['B3', 'B11']).rename('MNDWI'); // agua
+  return img.addBands([ndvi, mndwi]);
+}
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(roi)
+  .filterDate(ANIO_INICIO + '-01-01', (ANIO_FIN + 1) + '-01-01')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', NUBES_MAX))
+  .map(enmascararS2)
+  .map(agregarIndices);
+
+// ============================================================
+// 4) PROCESAMIENTO MENSUAL -> Feature con áreas
+// ============================================================
+var area_px = ee.Image.pixelArea();
+
+function reducirArea(imgMask) {
+  return area_px.updateMask(imgMask).reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: roi, scale: ESCALA,
+    maxPixels: 1e13, bestEffort: true, tileScale: 4
+  }).getNumber('area');
+}
+
+function procesarMes(anio, mes) {
+  anio = ee.Number(anio);
+  mes  = ee.Number(mes);
+  var inicio = ee.Date.fromYMD(anio, mes, 1);
+  var fin    = inicio.advance(1, 'month');
+  var col    = s2.filterDate(inicio, fin);
+  var n      = col.size();
+
+  // Cadena de fecha "YYYY-MM" y fecha decimal para ordenar el eje X
+  var fechaStr = inicio.format('YYYY-MM');
+  var fechaDec = anio.add(mes.subtract(1).divide(12));
+
+  // Caso con imágenes: clasificar y medir
+  var calcular = function () {
+    var comp   = col.median();
+    var ndviAq = comp.select('NDVI').updateMask(mascaraAcuatica);
+
+    var validos  = ndviAq.mask();                  // datos libres de nube en el dominio
+    var flotante = ndviAq.gte(NDVI_FLOTANTE);      // macrófitas flotantes/emergentes
+    var agua     = ndviAq.lt(NDVI_AGUA);           // agua abierta
+
+    var areaFlotanteHa = reducirArea(flotante.selfMask()).divide(1e4);
+    var areaAguaHa     = reducirArea(agua.selfMask()).divide(1e4);
+    var areaValidaHa   = reducirArea(validos).divide(1e4);
+    var fracValida     = areaValidaHa.divide(areaDominioHa);
+
+    return ee.Feature(null, {
+      'anio': anio, 'mes': mes, 'fecha': fechaStr, 'fecha_dec': fechaDec,
+      'n_imagenes': n,
+      'area_flotante_ha': areaFlotanteHa,
+      'area_agua_ha': areaAguaHa,
+      'area_valida_ha': areaValidaHa,
+      'frac_valida': fracValida
+    });
+  };
+
+  // Caso sin imágenes: feature con marcador -1
+  var vacio = ee.Feature(null, {
+    'anio': anio, 'mes': mes, 'fecha': fechaStr, 'fecha_dec': fechaDec,
+    'n_imagenes': 0,
+    'area_flotante_ha': -1, 'area_agua_ha': -1,
+    'area_valida_ha': -1, 'frac_valida': -1
+  });
+
+  return ee.Feature(ee.Algorithms.If(n.gt(0), calcular(), vacio));
+}
+
+// ============================================================
+// 5) MAPEAR SOBRE TODOS LOS AÑOS x MESES
+// ============================================================
+var anios = ee.List.sequence(ANIO_INICIO, ANIO_FIN);
+var meses = ee.List.sequence(1, 12);
+
+var features = anios.map(function (y) {
+  return meses.map(function (m) { return procesarMes(y, m); });
+}).flatten();
+
+var tabla = ee.FeatureCollection(ee.List(features));
+
+// Solo meses con datos para graficar
+var tablaValida = tabla.filter(ee.Filter.gt('area_flotante_ha', -1));
+
+// ============================================================
+// 6) GRÁFICA DE LA SERIE TEMPORAL (vista previa interactiva)
+// ============================================================
+var grafico = ui.Chart.feature.byFeature(tablaValida, 'fecha_dec',
+                ['area_flotante_ha', 'area_agua_ha'])
+  .setChartType('LineChart')
+  .setOptions({
+    title: 'Dinámica mensual de macrófitas flotantes — Ciénaga de Zapatosa',
+    hAxis: {title: 'Año (decimal)', format: '####'},
+    vAxis: {title: 'Área (ha)'},
+    series: {
+      0: {color: '#2ca02c', labelInLegend: 'Macrófitas flotantes'},
+      1: {color: '#1f78b4', labelInLegend: 'Agua abierta'}
+    },
+    lineWidth: 2, pointSize: 3, interpolateNulls: true
+  });
+print(grafico);
+
+// Tabla resumida en consola (para revisión rápida; la completa va al CSV)
+print('Tabla mensual (muestra):', tablaValida.limit(60));
+
+// ============================================================
+// 7) EXPORTAR TABLA COMPLETA A CSV (Google Drive)
+//    -> Ejecuta esta tarea desde la pestaña "Tasks".
+// ============================================================
+Export.table.toDrive({
+  collection: tabla,
+  description: 'macrofitas_zapatosa_' + ANIO_INICIO + '_' + ANIO_FIN,
+  folder: 'GEE_Zapatosa',
+  fileNamePrefix: 'macrofitas_zapatosa_' + ANIO_INICIO + '_' + ANIO_FIN,
+  fileFormat: 'CSV',
+  selectors: ['anio', 'mes', 'fecha', 'n_imagenes',
+              'area_flotante_ha', 'area_agua_ha', 'area_valida_ha', 'frac_valida']
+});
+
+// ============================================================
+// 8) VISUALIZACIÓN DE UN MES REPRESENTATIVO
+//    Cambia ANIO_VIS / MES_VIS para inspeccionar otros meses.
+// ============================================================
+var ANIO_VIS = 2022;
+var MES_VIS  = 2;     // p. ej. febrero (época seca/aguas bajas)
+
+(function mostrarMes(anio, mes) {
+  var inicio = ee.Date.fromYMD(anio, mes, 1);
+  var col = s2.filterDate(inicio, inicio.advance(1, 'month'));
+  var comp = col.median();
+
+  // RGB color natural
+  Map.addLayer(comp.clip(roi), {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000},
+               'RGB ' + anio + '-' + mes, true);
+
+  // Clasificación dentro del dominio acuático
+  var ndviAq = comp.select('NDVI').updateMask(mascaraAcuatica);
+  var clasif = ndviAq.gte(NDVI_FLOTANTE).rename('clase')                // 1 flotante
+               .add(ndviAq.gte(NDVI_AGUA).and(ndviAq.lt(NDVI_FLOTANTE))) // suma 1 -> dispersa
+               .add(ndviAq.lt(NDVI_AGUA).multiply(0));                   // agua queda en 0
+  // Reasignar: agua=1, dispersa=2, flotante=3 para una paleta clara
+  var claseFinal = ndviAq.expression(
+      "(b < a) ? 1 : ((b < f) ? 2 : 3)",
+      {b: ndviAq, a: NDVI_AGUA, f: NDVI_FLOTANTE}
+  ).updateMask(mascaraAcuatica);
+
+  Map.addLayer(claseFinal,
+    {min: 1, max: 3, palette: ['#1f78b4', '#ffff99', '#2ca02c']},
+    'Clasificación ' + anio + '-' + mes + ' (azul=agua, amarillo=disp., verde=flotante)',
+    true);
+})(ANIO_VIS, MES_VIS);
+
+// ============================================================
+// 9) (OPCIONAL) PROXY DE BIOMASA — REQUIERE CALIBRACIÓN LOCAL
+//    La biomasa NO se obtiene directamente del satélite. Esta relación
+//    lineal Biomasa[kg/m2] = a*NDVI + b es SOLO ilustrativa: debes ajustar
+//    a y b con muestreos de campo (cuadrantes + peso seco) antes de reportarla.
+// ============================================================
+/*
+var a_bio = 4.0;   // PLACEHOLDER — calibrar con datos de campo
+var b_bio = 0.0;   // PLACEHOLDER — calibrar con datos de campo
+
+function biomasaMes(anio, mes) {
+  var inicio = ee.Date.fromYMD(anio, mes, 1);
+  var comp = s2.filterDate(inicio, inicio.advance(1, 'month')).median();
+  var ndviAq = comp.select('NDVI').updateMask(mascaraAcuatica);
+  var flotante = ndviAq.gte(NDVI_FLOTANTE);
+  var biomasaDens = ndviAq.multiply(a_bio).add(b_bio).updateMask(flotante.selfMask()); // kg/m2
+  var biomasaTotalKg = biomasaDens.multiply(ee.Image.pixelArea())
+    .reduceRegion({reducer: ee.Reducer.sum(), geometry: roi, scale: ESCALA,
+                   maxPixels: 1e13, bestEffort: true, tileScale: 4}).getNumber('NDVI');
+  return biomasaTotalKg; // kg de biomasa (peso seco estimado)
+}
+// print('Biomasa estimada feb-2022 (kg):', biomasaMes(2022, 2));
+*/
